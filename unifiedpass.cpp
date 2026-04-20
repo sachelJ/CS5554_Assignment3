@@ -6,7 +6,8 @@
 #include <numeric>
 #include <string>
 #include <vector>
-
+#include <llvm/Analysis/LoopInfo.h>
+#include <llvm/Transforms/Scalar/LoopPassManager.h>
 #include <llvm/ADT/BitVector.h>
 #include <llvm/ADT/DenseMap.h>
 #include <llvm/IR/BasicBlock.h>
@@ -19,7 +20,12 @@
 #include <llvm/Passes/PassBuilder.h>
 #include <llvm/Passes/PassPlugin.h>
 #include <llvm/Support/raw_ostream.h>
-
+#include <llvm/IR/IntrinsicInst.h>
+#include <llvm/ADT/DenseSet.h>
+#include <llvm/ADT/SmallVector.h>
+#include <llvm/Analysis/ValueTracking.h>
+#include <llvm/ADT/SmallPtrSet.h>
+#include <llvm/IR/IRBuilder.h>
 using namespace llvm;
 
 namespace {
@@ -721,6 +727,332 @@ struct ConstantPropPass : PassInfoMixin<ConstantPropPass> {
   }
 };
 
+struct DominatorsPass : PassInfoMixin<DominatorsPass> {
+
+    PreservedAnalyses run(Function& F, FunctionAnalysisManager& FAM) {
+        auto& LI = FAM.getResult<LoopAnalysis>(F);
+
+        outs() << "=== Dominators for ";
+        F.printAsOperand(outs(), false);
+        outs() << " ===\n";
+
+        std::vector<BasicBlock*> blocks;
+        for (auto& BB : F) blocks.push_back(&BB);
+        int N = blocks.size();
+
+        DenseMap<BasicBlock*, int> blockIdx;
+        for (int i = 0; i < N; i++) {
+            blockIdx[blocks[i]] = i;
+        }
+
+        DenseMap<BasicBlock*, BitVector> dom;
+        for (int i = 0; i < N; i++) {
+            dom[blocks[i]] = BitVector(N, true);
+        }
+
+        BasicBlock* entry = &F.getEntryBlock();
+        dom[entry] = BitVector(N, false);
+        dom[entry].set(blockIdx[entry]);
+
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            for (int i = 0; i < N; i++) {
+                BasicBlock* B = blocks[i];
+                if (B == entry) continue;
+
+                BitVector newDom(N, true);
+                bool hasPred = false;
+
+                for (BasicBlock* P : predecessors(B)) {
+                    if (!hasPred) {
+                        newDom = dom[P];
+                        hasPred = true;
+                    }
+                    else {
+                        newDom &= dom[P];
+                    }
+                }
+
+                if (!hasPred) {
+                    newDom = BitVector(N, false);
+                }
+
+                newDom.set(i);
+
+                if (newDom != dom[B]) {
+                    dom[B] = newDom;
+                    changed = true;
+                }
+            }
+        }
+
+        auto printBB = [&](BasicBlock* BB) {
+            if (!BB) {
+                outs() << "(none)";
+            }
+            else if (BB->hasName()) {
+                outs() << BB->getName();
+            }
+            else {
+                BB->printAsOperand(outs(), false);
+            }
+            };
+
+        auto getIDom = [&](BasicBlock* B) -> BasicBlock* {
+            if (B == entry) return nullptr;
+
+            int bIdx = blockIdx[B];
+            BasicBlock* idom = nullptr;
+
+            for (int j = 0; j < N; j++) {
+                if (j == bIdx) continue;
+                if (!dom[B].test(j)) continue;
+
+                bool isImmediate = true;
+                for (int k = 0; k < N; k++) {
+                    if (k == j || k == bIdx) continue;
+                    if (dom[B].test(k) && dom[blocks[k]].test(j)) {
+                        isImmediate = false;
+                        break;
+                    }
+                }
+
+                if (isImmediate) {
+                    idom = blocks[j];
+                    break;
+                }
+            }
+
+            return idom;
+            };
+
+        for (Loop* L : LI) {
+            SmallVector<BasicBlock*, 8> toPrint;
+
+            for (BasicBlock* B : L->blocks()) {
+                toPrint.push_back(B);
+            }
+
+            SmallVector<BasicBlock*, 8> exitBlocks;
+            L->getExitBlocks(exitBlocks);
+            for (BasicBlock* EB : exitBlocks) {
+                if (std::find(toPrint.begin(), toPrint.end(), EB) == toPrint.end()) {
+                    toPrint.push_back(EB);
+                }
+            }
+
+            for (BasicBlock* B : toPrint) {
+                if (B == entry) continue;
+
+                BasicBlock* idom = getIDom(B);
+                printBB(B);
+                outs() << " is dominated by ";
+                printBB(idom);
+                outs() << "\n";
+            }
+        }
+
+        return PreservedAnalyses::all();
+    }
+};
+
+
+struct DeadCodeEliminationPass : PassInfoMixin<DeadCodeEliminationPass> {
+    static bool isLive(Instruction* I) {
+        return I->isTerminator() ||
+            isa<DbgInfoIntrinsic>(I) ||
+            isa<LandingPadInst>(I) ||
+            I->mayHaveSideEffects();
+    }
+
+    PreservedAnalyses run(Function& F, FunctionAnalysisManager&) {
+        errs() << "RUNNING DCE ON " << F.getName() << "\n";
+
+        bool changedAny = false;
+        bool changed = true;
+
+        while (changed) {
+            changed = false;
+
+            DenseSet<Instruction*> live;
+            SmallVector<Instruction*, 64> worklist;
+
+            for (BasicBlock& BB : F) {
+                for (Instruction& I : BB) {
+                    if (isLive(&I)) {
+                        live.insert(&I);
+                        worklist.push_back(&I);
+                    }
+                }
+            }
+
+            while (!worklist.empty()) {
+                Instruction* I = worklist.pop_back_val();
+
+                for (Use& U : I->operands()) {
+                    if (Instruction* OpI = dyn_cast<Instruction>(U.get())) {
+                        if (!live.count(OpI)) {
+                            live.insert(OpI);
+                            worklist.push_back(OpI);
+                        }
+                    }
+                }
+            }
+
+            SmallVector<Instruction*, 32> toRemove;
+            for (BasicBlock& BB : F) {
+                for (Instruction& I : BB) {
+                    if (!live.count(&I) && I.use_empty()) {
+                        toRemove.push_back(&I);
+                    }
+                }
+            }
+
+            for (auto it = toRemove.rbegin(); it != toRemove.rend(); ++it) {
+                Instruction* I = *it;
+                errs() << "Removing Instruction: ";
+                I->print(errs());
+                errs() << "\n";
+                I->eraseFromParent();
+                changed = true;
+                changedAny = true;
+            }
+        }
+
+        return changedAny ? PreservedAnalyses::none() : PreservedAnalyses::all();
+    }
+};
+
+struct LoopInvariantCodeMotionPass : PassInfoMixin<LoopInvariantCodeMotionPass> {
+    struct DomInfo {
+        std::vector<BasicBlock*> blocks;
+        DenseMap<BasicBlock*, int> blockIdx;
+        DenseMap<BasicBlock*, BitVector> dom;
+    };
+
+    static DomInfo computeDominators(Function& F) {
+        DomInfo DI;
+        for (auto& BB : F) {
+            DI.blockIdx[&BB] = static_cast<int>(DI.blocks.size());
+            DI.blocks.push_back(&BB);
+        }
+        int N = static_cast<int>(DI.blocks.size());
+        BasicBlock* entry = &F.getEntryBlock();
+        for (BasicBlock* BB : DI.blocks)
+            DI.dom[BB] = BitVector(N, true);
+        DI.dom[entry] = BitVector(N, false);
+        DI.dom[entry].set(DI.blockIdx[entry]);
+
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            for (BasicBlock* B : DI.blocks) {
+                if (B == entry) continue;
+                BitVector newDom(N, true);
+                bool hasPred = false;
+                for (BasicBlock* P : predecessors(B)) {
+                    if (!hasPred) { newDom = DI.dom[P]; hasPred = true; }
+                    else newDom &= DI.dom[P];
+                }
+                if (!hasPred) newDom = BitVector(N, false);
+                newDom.set(DI.blockIdx[B]);
+                if (newDom != DI.dom[B]) { DI.dom[B] = newDom; changed = true; }
+            }
+        }
+        return DI;
+    }
+
+    static bool blockDominates(BasicBlock* A, BasicBlock* B, const DomInfo& DI) {
+        auto itA = DI.blockIdx.find(A);
+        auto itB = DI.blockIdx.find(B);
+        if (itA == DI.blockIdx.end() || itB == DI.blockIdx.end()) return false;
+        return DI.dom.lookup(B).test(itA->second);
+    }
+
+    static bool isHoistableInstruction(Instruction* I) {
+        return !isa<PHINode>(I) &&
+            !isa<LandingPadInst>(I) &&
+            !I->isTerminator() &&
+            !I->mayReadFromMemory() &&
+            isSafeToSpeculativelyExecute(I);
+    }
+
+    static bool operandIsLoopInvariant(Value* V, Loop* L,
+        const SmallPtrSetImpl<Instruction*>& invariantSet) {
+        if (isa<Constant>(V) || isa<Argument>(V)) return true;
+        if (auto* I = dyn_cast<Instruction>(V))
+            return !L->contains(I) || invariantSet.contains(I);
+        return true;
+    }
+
+    static bool processLoop(Loop* L, Function& F) {
+        bool changedAny = false;
+
+        // Process inner loops first (bottom-up)
+        for (Loop* SubL : *L)
+            changedAny |= processLoop(SubL, F);
+
+        BasicBlock* preheader = L->getLoopPreheader();
+        if (!preheader) {
+            errs() << "  Skipping loop (no preheader)\n";
+            return changedAny;
+        }
+
+        DomInfo DI = computeDominators(F);
+
+        // Find all loop-invariant instructions to fixpoint
+        SmallPtrSet<Instruction*, 32> invariantSet;
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            for (BasicBlock* BB : L->blocks()) {
+                for (Instruction& I : *BB) {
+                    if (invariantSet.contains(&I)) continue;
+                    if (!isHoistableInstruction(&I)) continue;
+                    bool allInvariant = true;
+                    for (Value* Op : I.operands()) {
+                        if (!operandIsLoopInvariant(Op, L, invariantSet)) {
+                            allInvariant = false;
+                            break;
+                        }
+                    }
+                    if (allInvariant) { invariantSet.insert(&I); changed = true; }
+                }
+            }
+        }
+
+        // Collect invariants in loop order to preserve dependencies
+        SmallVector<Instruction*, 32> toHoist;
+        for (BasicBlock* BB : L->blocks()) {
+            for (Instruction& I : *BB) {
+                if (!invariantSet.contains(&I)) continue;
+                toHoist.push_back(&I);
+            }
+        }
+
+        // Hoist all invariants to preheader (conservative approach)
+        for (Instruction* I : toHoist) {
+            errs() << "Hoisting to preheader: ";
+            I->print(errs());
+            errs() << "\n";
+            I->moveBefore(preheader->getTerminator()->getIterator());
+            changedAny = true;
+        }
+
+        return changedAny;
+    }
+
+    PreservedAnalyses run(Function& F, FunctionAnalysisManager& FAM) {
+        errs() << "RUNNING LICM ON " << F.getName() << "\n";
+        auto& LI = FAM.getResult<LoopAnalysis>(F);
+        bool changed = false;
+        for (Loop* L : LI)
+            changed |= processLoop(L, F);
+        return changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
+    }
+};
+
 }  // namespace
 
 extern "C" LLVM_ATTRIBUTE_WEAK PassPluginLibraryInfo llvmGetPassPluginInfo() {
@@ -739,6 +1071,18 @@ extern "C" LLVM_ATTRIBUTE_WEAK PassPluginLibraryInfo llvmGetPassPluginInfo() {
                   if (Name == "reaching") {
                     FPM.addPass(ReachingPass());
                     return true;
+                  }
+                  if (Name == "doms") {
+                      FPM.addPass(DominatorsPass());
+                      return true;
+                  }
+                  if (Name == "dead-code-elimination") {
+                      FPM.addPass(DeadCodeEliminationPass());
+                      return true;
+                  }
+                  if (Name == "loop-invariant-code-motion") {
+                      FPM.addPass(LoopInvariantCodeMotionPass());
+                      return true;
                   }
                   if (Name == "constantprop") {
                     FPM.addPass(ConstantPropPass());

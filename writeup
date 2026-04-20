@@ -1,0 +1,158 @@
+ECE/CS 5544 Assignment 3 - Part 1 Writeup
+==========================================
+
+
+1. BUILDING AND RUNNING
+------------------------
+
+Build:
+    make
+
+Dominators:
+    clang -O0 -emit-llvm -c test.c -o test.bc
+    opt -passes=mem2reg,loop-simplify test.bc -o test_opt.bc
+    opt --load-pass-plugin=./build/unifiedpass.so \
+        --passes="doms" test_opt.bc -S -o /dev/null
+
+Dead Code Elimination:
+    clang -O0 -emit-llvm -c test.c -o test.bc
+    opt -passes=mem2reg test.bc -o test_m2r.bc
+    opt --load-pass-plugin=./build/unifiedpass.so \
+        --passes="dead-code-elimination" test_m2r.bc -S -o /dev/null
+
+Loop Invariant Code Motion:
+    clang -O0 -Xclang -disable-O0-optnone -emit-llvm -c test.c -o test.bc
+    opt -passes=mem2reg,loop-simplify test.bc -o test_opt.bc
+    opt --load-pass-plugin=./build/unifiedpass.so \
+        --passes="loop-invariant-code-motion" test_opt.bc -S -o out.ll
+
+
+2. IMPLEMENTATION SUMMARY
+--------------------------
+
+Dominators:
+    Implements iterative dataflow to compute dominator sets using BitVector.
+    Each block's dominator set is initialized to all blocks, then iteratively
+    intersected over predecessors until fixed point. Immediate dominators are
+    computed by finding the closest strict dominator. Uses LoopAnalysis via
+    FAM.getResult<LoopAnalysis>(F) to identify loops and prints the immediate
+    dominator of each block in each loop using BasicBlock::getName().
+
+Dead Code Elimination:
+    Uses a mark-and-sweep worklist algorithm. Instructions are initially live
+    if they are terminators, debug intrinsics, landing pads, or have side
+    effects. Liveness propagates backward through operands. Any instruction
+    not marked live with no remaining uses is removed. The process repeats
+    until no more instructions can be eliminated.
+
+Loop Invariant Code Motion:
+    Processes loops bottom-up (inner first). For each loop, requires a
+    preheader (inserted by loop-simplify). Iteratively identifies
+    loop-invariant instructions whose operands are all constants, arguments,
+    defined outside the loop, or already identified as invariant, and that
+    are safe to speculatively execute and do not read memory. All invariants
+    are collected in traversal order (preserving dependencies) and hoisted
+    to the preheader. Dominator information is computed internally using the
+    same bitset algorithm as the Dominators pass.
+
+
+3. LICM MICROBENCHMARKS
+------------------------
+
+Instruction counts measured with:
+    lli -stats -force-interpreter file.bc 2>&1 | grep "dynamic instructions"
+
+--- Benchmark 1: Single invariant (x * y hoisted) ---
+
+Code:
+    int test(int x, int y) {
+        int sum = 0;
+        for (int i = 0; i < 1000; i++) {
+            int t = x * y;  // invariant
+            sum += t;
+        }
+        return sum;
+    }
+
+    Before LICM : 7,006 instructions
+    After LICM  : 6,007 instructions
+    Saved       : 999   (1.17x speedup)
+
+x * y is hoisted once to the preheader, saving one multiply per iteration.
+
+--- Benchmark 2: Two invariants (a + b and b * c hoisted) ---
+
+Code:
+    int test(int a, int b, int c) {
+        int sum = 0;
+        for (int i = 0; i < 1000; i++) {
+            int x = a + b;  // invariant
+            int y = b * c;  // invariant
+            sum += x + y + i;
+        }
+        return sum;
+    }
+
+    Before LICM : 10,006 instructions
+    After LICM  :  7,009 instructions
+    Saved       :  2,997 (1.43x speedup)
+
+Two invariant expressions hoisted, saving 2 instructions per iteration
+over 1000 iterations.
+
+--- Benchmark 3: Nested loop (x * 2 hoisted out of inner loop) ---
+
+Code:
+    int test(int x) {
+        int sum = 0;
+        for (int i = 0; i < 100; i++) {
+            for (int j = 0; j < 100; j++) {
+                int t = x * 2;  // invariant to both loops
+                sum += t + i;
+            }
+        }
+        return sum;
+    }
+
+    Before LICM : 80,806 instructions
+    After LICM  : 60,907 instructions
+    Saved       : 19,899 (1.33x speedup)
+
+x * 2 is invariant to both loops. Hoisting it out of the inner loop saves
+one multiply per inner iteration, amounting to 10,000 saves across the
+full 100x100 execution.
+
+
+4. DCE MICROBENCHMARKS
+-----------------------
+
+--- Benchmark 1: Unused arithmetic ---
+
+Code:
+    int main() {
+        int x = 1;
+        int a = x + 50;   // never used
+        int b = a * 96;   // never used
+        return 0;
+    }
+
+DCE removes a and b since they have no side effects and their values
+are never used in any live computation.
+
+--- Benchmark 2: Dead branch results ---
+
+Code:
+    int main(int argc, const char* argv[]) {
+        int x = 1;
+        int a = x + 50;
+        int b = a + 96;
+        int c, d;
+        if (a > 50) { c = a - 50; d = a * 96; }
+        else        { c = a + 50; d = a * 96; }
+        int e = 50 - 96;
+        int f = e + c;
+        return 0;
+    }
+
+All intermediate computations are eliminated since return 0 does not
+depend on any of them.
